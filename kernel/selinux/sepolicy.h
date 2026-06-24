@@ -1,5 +1,6 @@
 #ifndef __KSU_H_SEPOLICY
 #define __KSU_H_SEPOLICY
+#ifdef CONFIG_KSU_SELINUX
 
 #include <linux/types.h>
 

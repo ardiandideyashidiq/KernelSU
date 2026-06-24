@@ -469,6 +469,7 @@ static void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *
     fput(file);
 }
 
+#ifdef CONFIG_KSU_HANDLE_INPUT_EVENT
 static unsigned int volumedown_pressed_count = 0;
 
 static bool is_volumedown_enough(unsigned int count)
@@ -604,19 +605,31 @@ static int input_handle_event_handler_pre(struct kprobe *p, struct pt_regs *regs
     return ksu_handle_input_handle_event(type, code, value);
 }
 
+#ifdef CONFIG_KSU_HANDLE_INPUT_EVENT
 static struct kprobe input_event_kp = {
     .symbol_name = "input_event",
     .pre_handler = input_handle_event_handler_pre,
 };
+#endif
 
 static void do_stop_input_hook(struct work_struct *work)
 {
     unregister_kprobe(&input_event_kp);
 }
 
-static void stop_init_rc_hook()
+static void stop_execve_hook()
 {
-    ksu_syscall_table_unhook(__NR_read);
+    static bool stop_execve_hook_stopped = false;
+    if (stop_execve_hook_stopped) {
+        return;
+    }
+    stop_execve_hook_stopped = true;
+    bool ret = schedule_work(&stop_execve_hook_work);
+    if (stop_init_rc_hook_stopped) {
+        return;
+    }
+    stop_init_rc_hook_stopped = true;
+    bool ret = schedule_work(&stop_init_rc_hook_work);
     ksu_syscall_table_unhook(__NR_fstat);
     pr_info("unregister init_rc syscall hook\n");
 }
@@ -637,22 +650,29 @@ void __init ksu_ksud_init()
 {
     int ret;
 
-    ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
-    ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
+    ret = register_kretprobe(&sys_fstat_kp);
+    pr_info("ksud: sys_fstat_kp: %d\n", ret);
 
+#ifdef CONFIG_KSU_HANDLE_INPUT_EVENT
     ret = register_kprobe(&input_event_kp);
     pr_info("ksud: input_event_kp: %d\n", ret);
+#endif
 
+    INIT_WORK(&stop_init_rc_hook_work, do_stop_init_rc_hook);
+    INIT_WORK(&stop_execve_hook_work, do_stop_execve_hook);
+#ifdef CONFIG_KSU_HANDLE_INPUT_EVENT
     INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
-}
-
-void __exit ksu_ksud_exit()
+#endif
+void ksu_ksud_exit()
 {
-    // TODO:
-    // this should be done before unregister vfs_read_kp
-    // stop_init_rc_hook();
-    unregister_kprobe(&input_event_kp);
+    stop_execve_hook();
+    // this should be done before unregister sys_read_kp
+    stop_init_rc_hook();
 
+#ifdef CONFIG_KSU_HANDLE_INPUT_EVENT
+    stop_input_hook();
+#endif
+}
     if (module_rc_buf) {
         free_module_rc();
     }

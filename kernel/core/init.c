@@ -13,6 +13,7 @@
 #include "manager/manager_observer.h"
 #include "manager/throne_tracker.h"
 #include "hook/syscall_hook_manager.h"
+#include "hook/tp_marker.h"
 #include "hook/lsm_hook.h"
 #include "runtime/ksud.h"
 #include "runtime/ksud_boot.h"
@@ -102,7 +103,7 @@ int __init kernelsu_init(void)
     }
 #endif
 
-#ifdef MODULE
+#if defined(MODULE) && !defined(CONFIG_KSU_NON_ANDROID)
 	ksu_late_loaded = (current->pid != 1);
 #else
 	ksu_late_loaded = false;
@@ -144,11 +145,11 @@ int __init kernelsu_init(void)
 
 	if (ksu_late_loaded) {
 		pr_info("late load mode, skipping kprobe hooks\n");
-
+#ifdef CONFIG_KSU_SELINUX
 		apply_kernelsu_rules();
 		cache_sid();
 		setup_ksu_cred();
-
+#endif
 		// Grant current process (ksud late-load) root
 		// with KSU SELinux domain before enforcing SELinux, so it
 		// can continue to access /data/app etc. after enforcement.
@@ -159,6 +160,10 @@ int __init kernelsu_init(void)
 
 		ksu_syscall_hook_manager_init();
 
+#ifdef CONFIG_KSU_NON_ANDROID
+		ksu_tp_marker_sched_init();
+#endif
+
 		ksu_throne_tracker_init();
 		ksu_observer_init();
 		ksu_file_wrapper_init();
@@ -166,13 +171,19 @@ int __init kernelsu_init(void)
 		ksu_boot_completed = true;
 		track_throne(false);
 
+#ifdef CONFIG_KSU_SELINUX
 		if (!getenforce()) {
 			pr_info("Permissive SELinux, enforcing\n");
 			setenforce(true);
 		}
+#endif
 
 	} else {
 		ksu_syscall_hook_manager_init();
+
+#ifdef CONFIG_KSU_NON_ANDROID
+		ksu_tp_marker_sched_init();
+#endif
 
 		ksu_allowlist_init();
 
@@ -184,7 +195,7 @@ int __init kernelsu_init(void)
 	}
 
 #ifdef MODULE
-#ifndef CONFIG_KSU_DEBUG
+#if !(defined(CONFIG_KSU_DEBUG) || defined(CONFIG_KSU_NON_ANDROID))
 	kobject_del(&THIS_MODULE->mkobj.kobj);
 #endif
 #endif
@@ -194,18 +205,23 @@ int __init kernelsu_init(void)
 void __exit kernelsu_exit(void)
 {
 	// Phase 1: Stop all hooks first to prevent new callbacks
+#ifdef CONFIG_KSU_NON_ANDROID
+	ksu_tp_marker_sched_exit();
+#endif
 	ksu_syscall_hook_manager_exit();
 
 	ksu_supercalls_exit();
 
-	if (!ksu_late_loaded)
+	if (ksu_late_loaded) {
+		ksu_observer_exit();
+	} else {
 		ksu_ksud_exit();
+	}
 
 	// Wait for any in-flight RCU readers (e.g. handler traversing allow_list)
 	synchronize_rcu();
 
 	// Phase 2: Now safe to release data structures
-	ksu_observer_exit();
 
 	ksu_throne_tracker_exit();
 

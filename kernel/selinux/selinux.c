@@ -1,8 +1,12 @@
 #include "selinux.h"
 #include "linux/cred.h"
+#include "linux/file.h"
+#include "linux/mm.h"
 #include "linux/sched.h"
-#include "objsec.h"
 #include "linux/version.h"
+
+#ifdef CONFIG_KSU_SELINUX
+#include "objsec.h"
 #include "klog.h" // IWYU pragma: keep
 #include "ksu.h"
 
@@ -210,6 +214,47 @@ bool is_init(const struct cred *cred)
 {
     return is_sid_match(cred, cached_init_sid, INIT_CONTEXT);
 }
+#else
+// Check zygote/init by pathname instead
+static bool compare_exec_filename(const char *filename)
+{
+    struct file *exe_file;
+    char buf[64];
+    char **path;
+
+    exe_file = get_mm_exe_file(current->mm);
+    if (!exe_file)
+        return false;
+
+    path = (char **)exe_file->f_path.dentry->d_name.name;
+    if (!path)
+        return false;
+
+    snprintf(buf, sizeof(buf), "%s", *path);
+    fput(exe_file);
+    return strcmp(buf, filename) == 0;
+}
+
+bool is_zygote(const struct cred *cred)
+{
+    if (compare_exec_filename("app_process") ||
+        compare_exec_filename("app_process32") ||
+        compare_exec_filename("app_process64"))
+        return true;
+    return false;
+}
+
+bool is_init(const struct cred *cred)
+{
+    return compare_exec_filename("init");
+}
+
+bool is_task_ksu_domain(const struct cred *cred)
+{
+    // ksu domain is only available when SELinux is enabled
+    return false;
+}
+#endif
 
 void escape_to_root_for_adb_root(void)
 {

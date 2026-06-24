@@ -7,8 +7,14 @@
 #include <linux/sched/task.h>
 
 #include "policy/allowlist.h"
-#include "klog.h" // IWYU pragma: keep
+#include "klog.h"
 #include "selinux/selinux.h"
+
+#ifdef CONFIG_KSU_NON_ANDROID
+#include <trace/events/sched.h>
+static bool enable_tracepoints = true;
+static int init_pid_global = 0;
+#endif
 
 // Tracepoint registration count management
 // == 1: just us
@@ -67,22 +73,31 @@ static void handle_process_mark(bool mark)
 
 void ksu_mark_all_process(void)
 {
+#ifndef CONFIG_KSU_NON_ANDROID
     handle_process_mark(true);
     pr_info("tp_marker: mark all user process done!\n");
+#endif
 }
 
 void ksu_unmark_all_process(void)
 {
+#ifndef CONFIG_KSU_NON_ANDROID
     handle_process_mark(false);
     pr_info("tp_marker: unmark all user process done!\n");
+#endif
 }
 
 void ksu_mark_running_process_locked(void)
 {
+#ifdef CONFIG_KSU_NON_ANDROID
+    // For non-Android: just mark the host init (pid 1) if it matches
+    // Individual processes get marked when Android container starts
+    pr_info("tp_marker: non-android mode, skipping process marking\n");
+#else
     struct task_struct *p, *t;
     read_lock(&tasklist_lock);
     for_each_process_thread (p, t) {
-        if (t->pid != 1 && !t->mm) {
+        if (task_pid_vnr(t) != 1 && !t->mm) {
             // skip kernel threads, but always allow pid 1
             continue;
         }
@@ -92,7 +107,7 @@ void ksu_mark_running_process_locked(void)
         bool is_zygote_process = is_zygote(cred);
         bool is_shell = uid == 2000;
         // before boot completed, we shall mark init for marking zygote
-        bool is_init = t->pid == 1;
+        bool is_init = task_pid_vnr(t) == 1;
         if (ksu_root_process || is_zygote_process || is_shell || is_init ||
             ksu_is_allow_uid(uid)) {
             ksu_set_task_tracepoint_flag(t);
@@ -106,6 +121,7 @@ void ksu_mark_running_process_locked(void)
         put_cred(cred);
     }
     read_unlock(&tasklist_lock);
+#endif
 }
 
 void ksu_mark_running_process(void)
@@ -174,3 +190,57 @@ int ksu_set_task_mark(pid_t pid, bool mark)
 
     return ret;
 }
+
+#ifdef CONFIG_KSU_NON_ANDROID
+// Called when a new process execs - track Android init container
+static void ksu_exec_handler(void *data, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+{
+    if (unlikely(enable_tracepoints && task_pid_vnr(p) == 1 && strcmp(bprm->filename, "/system/bin/init") == 0)) {
+        init_pid_global = p->pid;
+        pr_info("tp_marker: Android init (PID %i) namespace started\n", init_pid_global);
+        ksu_set_task_tracepoint_flag(p);
+    }
+}
+
+// Called when a process exits - check if Android container died
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+static void ksu_exit_handler(void *data, struct task_struct *p, bool group_dead)
+#else
+static void ksu_exit_handler(void *data, struct task_struct *p)
+#endif
+{
+    if (unlikely(enable_tracepoints && p->pid == init_pid_global)) {
+        enable_tracepoints = false;
+        pr_info("tp_marker: Android init (PID %i) namespace died\n", init_pid_global);
+    }
+}
+
+void ksu_tp_marker_sched_init(void)
+{
+    int ret;
+    ret = register_trace_sched_process_exec(ksu_exec_handler, NULL);
+    if (ret) {
+        pr_err("tp_marker: failed to register sched_process_exec tracepoint: %d\n", ret);
+    } else {
+        pr_info("tp_marker: sched_process_exec tracepoint registered\n");
+    }
+
+    ret = register_trace_sched_process_exit(ksu_exit_handler, NULL);
+    if (ret) {
+        pr_err("tp_marker: failed to register sched_process_exit tracepoint: %d\n", ret);
+    } else {
+        pr_info("tp_marker: sched_process_exit tracepoint registered\n");
+    }
+}
+
+void ksu_tp_marker_sched_exit(void)
+{
+    unregister_trace_sched_process_exec(ksu_exec_handler, NULL);
+    tracepoint_synchronize_unregister();
+    pr_info("tp_marker: sched_process_exec tracepoint unregistered\n");
+
+    unregister_trace_sched_process_exit(ksu_exit_handler, NULL);
+    tracepoint_synchronize_unregister();
+    pr_info("tp_marker: sched_process_exit tracepoint unregistered\n");
+}
+#endif
